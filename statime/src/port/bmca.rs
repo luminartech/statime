@@ -28,7 +28,7 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMu
         announce: crate::datastructures::messages::AnnounceMessage,
     ) -> PortActionIterator<'b> {
         // IEEE 1588-2019 9.5.3: Update according to table 33 (decision code S1)
-        if matches!(self.port_state, PortState::Slave(_))
+        if matches!(self.core.port_state, PortState::Slave(_))
             && announce.header.source_port_identity
                 == self
                     .instance_state
@@ -80,6 +80,7 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMu
         }
 
         if self
+            .core
             .bmca
             .register_announce_message(&message.header, &announce)
         {
@@ -87,15 +88,16 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMu
             // ensures that the message is acceptable wrt the acceptable master list.
             // This ensures that an administrator can block this mechanism via the
             // acceptable master list, making this less of an attack vector.
-            if self.port_identity.clock_identity
+            if self.core.port_identity.clock_identity
                 == message.header.source_port_identity.clock_identity
-                && self.port_identity.port_number > message.header.source_port_identity.port_number
+                && self.core.port_identity.port_number
+                    > message.header.source_port_identity.port_number
             {
-                self.multiport_disable = Some(Duration::ZERO);
+                self.core.multiport_disable = Some(Duration::ZERO);
                 self.set_forced_port_state(PortState::Passive);
             }
             actions![PortAction::ResetAnnounceReceiptTimer {
-                duration: self.config.announce_duration(&mut self.rng),
+                duration: self.core.config.announce_duration(&mut self.core.rng),
             }]
             .with_forward_tlvs(message.suffix.tlv(), message.header.source_port_identity)
         } else {
@@ -109,20 +111,20 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMu
     Port<'_, InBmca, A, R, C, F, S>
 {
     pub(crate) fn calculate_best_local_announce_message(&mut self) {
-        self.lifecycle.local_best = self.bmca.take_best_port_announce_message()
+        self.lifecycle.local_best = self.core.bmca.take_best_port_announce_message()
     }
 }
 
 impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, InBmca, A, R, C, F, S> {
     pub(crate) fn step_announce_age(&mut self, step: Duration) {
-        if let Some(mut age) = self.multiport_disable.take() {
+        if let Some(mut age) = self.core.multiport_disable.take() {
             age += step;
-            if age < self.config.announce_interval.as_duration() {
-                self.multiport_disable = Some(age)
+            if age < self.core.config.announce_interval.as_duration() {
+                self.core.multiport_disable = Some(age)
             }
         }
 
-        self.bmca.step_age(step);
+        self.core.bmca.step_age(step);
     }
 
     pub(crate) fn best_local_announce_message_for_bmca(&self) -> Option<BestAnnounceMessage> {
@@ -130,7 +132,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, InBmca, 
         // in the global operation of the best master clock algorithm or in the update
         // of data sets. We still need them during the calculation of the recommended
         // port state though to avoid getting multiple masters in the segment.
-        if self.config.master_only || matches!(self.port_state, PortState::Faulty) {
+        if self.core.config.master_only || matches!(self.core.port_state, PortState::Faulty) {
             None
         } else {
             self.lifecycle.local_best
@@ -179,7 +181,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, InBmca, 
             RecommendedState::M3(_) | RecommendedState::P1(_) | RecommendedState::P2(_) => {}
             RecommendedState::S1(announce_message) => {
                 // a master-only PTP port should never end up in the slave state
-                debug_assert!(!self.config.master_only);
+                debug_assert!(!self.core.config.master_only);
 
                 current_ds.steps_removed = announce_message.steps_removed + 1;
 
@@ -191,7 +193,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, InBmca, 
 
                 *time_properties_ds = announce_message.time_properties();
 
-                if let Err(error) = self.clock.set_properties(time_properties_ds) {
+                if let Err(error) = self.core.clock.set_properties(time_properties_ds) {
                     log::error!("Could not update clock: {:?}", error);
                 }
             }
@@ -215,11 +217,11 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, InBmca, 
             // TODO make sure states are complete
             RecommendedState::S1(announce_message) => {
                 // a master-only PTP port should never end up in the slave state
-                debug_assert!(!self.config.master_only);
+                debug_assert!(!self.core.config.master_only);
 
                 let remote_master = announce_message.header.source_port_identity;
 
-                let update_state = match &self.port_state {
+                let update_state = match &self.core.port_state {
                     PortState::Faulty => false,
                     PortState::Listening | PortState::Master | PortState::Passive => true,
                     PortState::Slave(old_state) => old_state.remote_master() != remote_master,
@@ -229,7 +231,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, InBmca, 
                     let state = PortState::Slave(SlaveState::new(remote_master));
                     self.set_forced_port_state(state);
 
-                    let duration = self.config.announce_duration(&mut self.rng);
+                    let duration = self.core.config.announce_duration(&mut self.core.rng);
                     let reset_announce = PortAction::ResetAnnounceReceiptTimer { duration };
                     let reset_delay = PortAction::ResetDelayRequestTimer {
                         duration: core::time::Duration::ZERO,
@@ -239,23 +241,23 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, InBmca, 
             }
             RecommendedState::M1(_) | RecommendedState::M2(_) | RecommendedState::M3(_) => {
                 if default_ds.slave_only {
-                    match self.port_state {
+                    match self.core.port_state {
                         PortState::Listening | PortState::Faulty => { /* do nothing */ }
                         PortState::Slave(_) | PortState::Passive | PortState::Master => {
                             self.set_forced_port_state(PortState::Listening);
 
                             // consistent with Port<InBmca>::new()
-                            let duration = self.config.announce_duration(&mut self.rng);
+                            let duration = self.core.config.announce_duration(&mut self.core.rng);
                             let reset_announce = PortAction::ResetAnnounceReceiptTimer { duration };
                             self.lifecycle.pending_action = actions![reset_announce];
                         }
                     }
-                } else if self.multiport_disable.is_some() {
-                    if !matches!(self.port_state, PortState::Passive) {
+                } else if self.core.multiport_disable.is_some() {
+                    if !matches!(self.core.port_state, PortState::Passive) {
                         self.set_forced_port_state(PortState::Passive);
                     }
                 } else {
-                    match self.port_state {
+                    match self.core.port_state {
                         PortState::Listening | PortState::Slave(_) | PortState::Passive => {
                             self.set_forced_port_state(PortState::Master);
 
@@ -270,7 +272,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, InBmca, 
                     }
                 }
             }
-            RecommendedState::P1(_) | RecommendedState::P2(_) => match self.port_state {
+            RecommendedState::P1(_) | RecommendedState::P2(_) => match self.core.port_state {
                 PortState::Listening | PortState::Slave(_) | PortState::Master => {
                     self.set_forced_port_state(PortState::Passive)
                 }
@@ -346,7 +348,8 @@ mod tests {
         port.set_forced_port_state(PortState::Master);
 
         let mut announce = default_announce_message();
-        announce.header.source_port_identity.clock_identity = port.port_identity.clock_identity;
+        announce.header.source_port_identity.clock_identity =
+            port.core.port_identity.clock_identity;
         announce.header.source_port_identity.port_number = 2;
         let announce_message = Message {
             header: announce.header,
@@ -363,11 +366,12 @@ mod tests {
         assert!(actions.next().is_none());
         drop(actions);
 
-        assert!(port.multiport_disable.is_none());
-        assert!(matches!(port.port_state, PortState::Master));
+        assert!(port.core.multiport_disable.is_none());
+        assert!(matches!(port.core.port_state, PortState::Master));
 
         let mut announce = default_announce_message();
-        announce.header.source_port_identity.clock_identity = port.port_identity.clock_identity;
+        announce.header.source_port_identity.clock_identity =
+            port.core.port_identity.clock_identity;
         announce.header.source_port_identity.port_number = 0;
         let announce_message = Message {
             header: announce.header,
@@ -384,8 +388,8 @@ mod tests {
         assert!(actions.next().is_none());
         drop(actions);
 
-        assert!(port.multiport_disable.is_some());
-        assert!(matches!(port.port_state, PortState::Passive));
+        assert!(port.core.multiport_disable.is_some());
+        assert!(matches!(port.core.port_state, PortState::Passive));
 
         let instanceconfig = InstanceConfig {
             clock_identity: ClockIdentity::from_mac_address([1, 2, 3, 4, 5, 6]),
@@ -403,18 +407,18 @@ mod tests {
             &InternalDefaultDS::new(instanceconfig),
         );
 
-        assert!(port.multiport_disable.is_some());
-        assert!(matches!(port.port_state, PortState::Passive));
+        assert!(port.core.multiport_disable.is_some());
+        assert!(matches!(port.core.port_state, PortState::Passive));
 
-        port.step_announce_age(port.config.announce_interval.as_duration());
-        port.step_announce_age(port.config.announce_interval.as_duration());
+        port.step_announce_age(port.core.config.announce_interval.as_duration());
+        port.step_announce_age(port.core.config.announce_interval.as_duration());
 
-        assert!(port.multiport_disable.is_none());
+        assert!(port.core.multiport_disable.is_none());
         port.set_recommended_port_state(
             &RecommendedState::M1(InternalDefaultDS::new(instanceconfig)),
             &InternalDefaultDS::new(instanceconfig),
         );
-        assert!(matches!(port.port_state, PortState::Master));
+        assert!(matches!(port.core.port_state, PortState::Master));
     }
 
     #[test]
@@ -430,7 +434,7 @@ mod tests {
         let default_ds = state.borrow().default_ds;
         port.set_recommended_port_state(&RecommendedState::M1(default_ds), &default_ds);
 
-        assert!(matches!(port.port_state, PortState::Listening));
+        assert!(matches!(port.core.port_state, PortState::Listening));
         let mut pending_action = port.lifecycle.pending_action;
         assert!(matches!(
             pending_action.next(),
@@ -468,7 +472,7 @@ mod tests {
             &default_ds,
         );
 
-        assert!(matches!(port.port_state, PortState::Listening));
+        assert!(matches!(port.core.port_state, PortState::Listening));
         let mut pending_action = port.lifecycle.pending_action;
         assert!(matches!(
             pending_action.next(),
@@ -539,7 +543,7 @@ mod tests {
         // the port should not be promoted to master.
         port.set_recommended_port_state(&recommended_state, &default_ds);
 
-        assert!(matches!(port.port_state, PortState::Listening));
+        assert!(matches!(port.core.port_state, PortState::Listening));
         let mut pending_action = port.lifecycle.pending_action;
         assert!(matches!(
             pending_action.next(),

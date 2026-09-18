@@ -22,9 +22,12 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
         if let Some(measurement) = self.extract_measurement() {
             // If the received message allowed the (slave) state to calculate its offset
             // from the master, update the local clock
-            let filter_updates = self.filter.measurement(measurement, &mut self.clock);
+            let filter_updates = self
+                .core
+                .filter
+                .measurement(measurement, &mut self.core.clock);
             if let Some(mean_delay) = filter_updates.mean_delay {
-                self.mean_delay = Some(mean_delay);
+                self.core.mean_delay = Some(mean_delay);
             }
             PortActionIterator::from_filter(filter_updates)
         } else {
@@ -37,7 +40,7 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
         timestamp_id: u16,
         timestamp: Time,
     ) -> PortActionIterator<'_> {
-        match self.port_state {
+        match self.core.port_state {
             PortState::Slave(ref mut state) => match state.delay_state {
                 DelayState::Measuring {
                     id,
@@ -69,7 +72,7 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
         timestamp_id: u16,
         timestamp: Time,
     ) -> PortActionIterator<'_> {
-        match self.peer_delay_state {
+        match self.core.peer_delay_state {
             PeerDelayState::Measuring {
                 id,
                 request_send_time: Some(_),
@@ -99,7 +102,7 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
         message: SyncMessage,
         recv_time: Time,
     ) -> PortActionIterator<'_> {
-        match self.port_state {
+        match self.core.port_state {
             PortState::Slave(ref mut state) => {
                 log::debug!("Received sync {:?}", header.sequence_id);
                 if state.remote_master != header.source_port_identity {
@@ -165,7 +168,7 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
         header: Header,
         message: FollowUpMessage,
     ) -> PortActionIterator<'_> {
-        match self.port_state {
+        match self.core.port_state {
             PortState::Slave(ref mut state) => {
                 log::debug!("Received FollowUp {:?}", header.sequence_id);
                 if state.remote_master != header.source_port_identity {
@@ -212,10 +215,10 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
         header: Header,
         message: DelayRespMessage,
     ) -> PortActionIterator<'_> {
-        match self.port_state {
+        match self.core.port_state {
             PortState::Slave(ref mut state) => {
                 log::debug!("Received DelayResp");
-                if self.port_identity != message.requesting_port_identity
+                if self.core.port_identity != message.requesting_port_identity
                     || state.remote_master != header.source_port_identity
                 {
                     return actions![];
@@ -259,11 +262,11 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
         message: PDelayRespMessage,
         recv_time: Time,
     ) -> PortActionIterator<'_> {
-        if self.port_identity != message.requesting_port_identity {
+        if self.core.port_identity != message.requesting_port_identity {
             return actions![];
         }
 
-        match self.peer_delay_state {
+        match self.core.peer_delay_state {
             PeerDelayState::PostMeasurement {
                 id,
                 responder_identity,
@@ -322,11 +325,11 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
         header: Header,
         message: PDelayRespFollowUpMessage,
     ) -> PortActionIterator<'_> {
-        if self.port_identity != message.requesting_port_identity {
+        if self.core.port_identity != message.requesting_port_identity {
             return actions![];
         }
 
-        match self.peer_delay_state {
+        match self.core.peer_delay_state {
             PeerDelayState::PostMeasurement {
                 id,
                 responder_identity,
@@ -386,7 +389,7 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
             response_recv_time: Some(response_recv_time),
             responder_identity: Some(responder_identity),
             id,
-        } = self.peer_delay_state
+        } = self.core.peer_delay_state
         {
             result.event_time = response_recv_time;
             result.peer_delay = Some(
@@ -394,14 +397,14 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
                     - (response_send_time - request_recv_time))
                     / 2.0,
             );
-            self.peer_delay_state = PeerDelayState::PostMeasurement {
+            self.core.peer_delay_state = PeerDelayState::PostMeasurement {
                 id,
                 responder_identity,
             };
 
             log::info!("Measurement: {:?}", result);
 
-            if matches!(self.port_state, PortState::Faulty) {
+            if matches!(self.core.port_state, PortState::Faulty) {
                 log::info!("Recovered port");
                 self.set_forced_port_state(PortState::Listening);
             }
@@ -409,7 +412,7 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
             return Some(result);
         }
 
-        match self.port_state {
+        match self.core.port_state {
             PortState::Slave(ref mut state) => {
                 if let SyncState::Measuring {
                     send_time: Some(send_time),
@@ -417,11 +420,11 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
                     ..
                 } = state.sync_state
                 {
-                    let raw_sync_offset = recv_time - send_time - self.config.delay_asymmetry;
+                    let raw_sync_offset = recv_time - send_time - self.core.config.delay_asymmetry;
                     result.event_time = recv_time;
                     result.raw_sync_offset = Some(raw_sync_offset);
 
-                    if let Some(mean_delay) = self.mean_delay {
+                    if let Some(mean_delay) = self.core.mean_delay {
                         result.offset = Some(raw_sync_offset - mean_delay);
                     }
 
@@ -433,7 +436,7 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
                     ..
                 } = state.delay_state
                 {
-                    let raw_delay_offset = send_time - recv_time - self.config.delay_asymmetry;
+                    let raw_delay_offset = send_time - recv_time - self.core.config.delay_asymmetry;
                     result.event_time = send_time;
                     result.raw_delay_offset = Some(raw_delay_offset);
 
@@ -458,7 +461,7 @@ impl<A, C: Clock, F: Filter, R, S> Port<'_, Running, A, R, C, F, S> {
 
 impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F, S> {
     pub(super) fn send_delay_request(&mut self) -> PortActionIterator<'_> {
-        match self.config.delay_mechanism {
+        match self.core.config.delay_mechanism {
             DelayMechanism::E2E { interval } => self.send_e2e_delay_request(interval),
             DelayMechanism::P2P { interval } => self.send_p2p_delay_request(interval),
         }
@@ -468,17 +471,17 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
         &mut self,
         log_min_pdelay_req_interval: Interval,
     ) -> PortActionIterator<'_> {
-        let pdelay_id = self.pdelay_seq_ids.generate();
+        let pdelay_id = self.core.pdelay_seq_ids.generate();
 
         let pdelay_req = self.instance_state.with_ref(|state| {
             Message::pdelay_req(
                 &state.default_ds,
-                self.port_identity,
+                self.core.port_identity,
                 pdelay_id,
-                self.config.minor_ptp_version.into(),
+                self.core.config.minor_ptp_version.into(),
             )
         });
-        let message_length = match pdelay_req.serialize(&mut self.packet_buffer) {
+        let message_length = match pdelay_req.serialize(&mut self.core.packet_buffer) {
             Ok(length) => length,
             Err(error) => {
                 log::error!("Could not serialize pdelay request: {:?}", error);
@@ -486,7 +489,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
             }
         };
 
-        self.peer_delay_state = PeerDelayState::Measuring {
+        self.core.peer_delay_state = PeerDelayState::Measuring {
             id: pdelay_id,
             responder_identity: None,
             request_send_time: None,
@@ -495,7 +498,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
             response_recv_time: None,
         };
 
-        let random = self.rng.sample::<f64, _>(rand::distributions::Open01);
+        let random = self.core.rng.sample::<f64, _>(rand::distributions::Open01);
         let factor = random * 2.0f64;
         let duration = log_min_pdelay_req_interval
             .as_core_duration()
@@ -507,7 +510,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
                 context: TimestampContext {
                     inner: TimestampContextInner::PDelayReq { id: pdelay_id },
                 },
-                data: &self.packet_buffer[..message_length],
+                data: &self.core.packet_buffer[..message_length],
                 link_local: true,
             }
         ]
@@ -517,21 +520,21 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
         &mut self,
         log_min_delay_req_interval: Interval,
     ) -> PortActionIterator<'_> {
-        match self.port_state {
+        match self.core.port_state {
             PortState::Slave(ref mut state) => {
                 log::debug!("Starting new delay measurement");
 
-                let delay_id = self.delay_seq_ids.generate();
+                let delay_id = self.core.delay_seq_ids.generate();
                 let delay_req = self.instance_state.with_ref(|state| {
                     Message::delay_req(
                         &state.default_ds,
-                        self.port_identity,
+                        self.core.port_identity,
                         delay_id,
-                        self.config.minor_ptp_version.into(),
+                        self.core.config.minor_ptp_version.into(),
                     )
                 });
 
-                let message_length = match delay_req.serialize(&mut self.packet_buffer) {
+                let message_length = match delay_req.serialize(&mut self.core.packet_buffer) {
                     Ok(length) => length,
                     Err(error) => {
                         log::error!("Could not serialize delay request: {:?}", error);
@@ -545,7 +548,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
                     recv_time: None,
                 };
 
-                let random = self.rng.sample::<f64, _>(rand::distributions::Open01);
+                let random = self.core.rng.sample::<f64, _>(rand::distributions::Open01);
                 let factor = random * 2.0f64;
                 let duration = log_min_delay_req_interval
                     .as_core_duration()
@@ -557,7 +560,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
                         context: TimestampContext {
                             inner: TimestampContextInner::DelayReq { id: delay_id },
                         },
-                        data: &self.packet_buffer[..message_length],
+                        data: &self.core.packet_buffer[..message_length],
                         link_local: false,
                     }
                 ]
@@ -630,7 +633,7 @@ mod tests {
         let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
 
         let state = SlaveState::new(Default::default());
-        port.mean_delay = Some(Duration::from_micros(100));
+        port.core.mean_delay = Some(Duration::from_micros(100));
 
         port.set_forced_port_state(PortState::Slave(state));
 
@@ -649,7 +652,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(49),
                 offset: Some(Duration::from_micros(-51)),
@@ -674,7 +677,7 @@ mod tests {
         );
         assert!(action.next().is_none());
         drop(action);
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.handle_follow_up(
             Header {
@@ -691,7 +694,7 @@ mod tests {
         drop(action);
 
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(1049),
                 offset: Some(Duration::from_micros(-53)),
@@ -709,10 +712,10 @@ mod tests {
 
         let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
 
-        port.config.delay_asymmetry = Duration::from_micros(100);
+        port.core.config.delay_asymmetry = Duration::from_micros(100);
 
         let state = SlaveState::new(Default::default());
-        port.mean_delay = Some(Duration::from_micros(100));
+        port.core.mean_delay = Some(Duration::from_micros(100));
 
         port.set_forced_port_state(PortState::Slave(state));
 
@@ -731,7 +734,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(49),
                 offset: Some(Duration::from_micros(-151)),
@@ -768,7 +771,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(49),
                 offset: None,
@@ -796,7 +799,7 @@ mod tests {
         let data = data.to_owned();
         assert!(action.next().is_none());
         drop(action);
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let req = Message::deserialize(&data).unwrap();
         let req_header = req.header;
@@ -814,7 +817,7 @@ mod tests {
         let mut action = port.handle_delay_timestamp(timestamp_id, Time::from_micros(100));
         assert!(action.next().is_none());
         drop(action);
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.handle_delay_resp(
             Header {
@@ -831,9 +834,9 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
 
-        assert_eq!(port.mean_delay, Some(Duration::from_micros(100)));
+        assert_eq!(port.core.mean_delay, Some(Duration::from_micros(100)));
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(100),
                 offset: None,
@@ -844,7 +847,7 @@ mod tests {
             })
         );
 
-        port.mean_delay = None;
+        port.core.mean_delay = None;
 
         let mut action = port.handle_sync(
             Header {
@@ -860,7 +863,7 @@ mod tests {
 
         assert!(action.next().is_none());
         drop(action);
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.send_delay_request();
 
@@ -879,7 +882,7 @@ mod tests {
         let data = data.to_owned();
         assert!(action.next().is_none());
         drop(action);
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let req = Message::deserialize(&data).unwrap();
         let req_header = req.header;
@@ -897,7 +900,7 @@ mod tests {
         let mut action = port.handle_delay_timestamp(timestamp_id, Time::from_micros(1100));
         assert!(action.next().is_none());
         drop(action);
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.handle_follow_up(
             Header {
@@ -912,7 +915,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(1049),
                 offset: None,
@@ -938,9 +941,9 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
 
-        assert_eq!(port.mean_delay, Some(Duration::from_micros(100)));
+        assert_eq!(port.core.mean_delay, Some(Duration::from_micros(100)));
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(1100),
                 offset: None,
@@ -959,7 +962,7 @@ mod tests {
         let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
 
         let state = SlaveState::new(Default::default());
-        port.mean_delay = Some(Duration::from_micros(100));
+        port.core.mean_delay = Some(Duration::from_micros(100));
 
         port.set_forced_port_state(PortState::Slave(state));
 
@@ -977,7 +980,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
 
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.handle_sync(
             Header {
@@ -995,7 +998,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(49),
                 offset: Some(Duration::from_micros(-63)),
@@ -1014,7 +1017,7 @@ mod tests {
         let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
 
         let state = SlaveState::new(Default::default());
-        port.mean_delay = Some(Duration::from_micros(100));
+        port.core.mean_delay = Some(Duration::from_micros(100));
 
         port.set_forced_port_state(PortState::Slave(state));
 
@@ -1033,7 +1036,7 @@ mod tests {
 
         assert!(action.next().is_none());
         drop(action);
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.handle_follow_up(
             Header {
@@ -1049,7 +1052,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
 
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.handle_follow_up(
             Header {
@@ -1065,7 +1068,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
 
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
     }
 
     #[test]
@@ -1075,7 +1078,7 @@ mod tests {
         let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
 
         let state = SlaveState::new(Default::default());
-        port.mean_delay = Some(Duration::from_micros(100));
+        port.core.mean_delay = Some(Duration::from_micros(100));
 
         port.set_forced_port_state(PortState::Slave(state));
 
@@ -1094,7 +1097,7 @@ mod tests {
 
         assert!(action.next().is_none());
         drop(action);
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.handle_sync(
             Header {
@@ -1111,7 +1114,7 @@ mod tests {
 
         assert!(action.next().is_none());
         drop(action);
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.handle_follow_up(
             Header {
@@ -1128,7 +1131,7 @@ mod tests {
         drop(action);
 
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(1049),
                 offset: Some(Duration::from_micros(-53)),
@@ -1166,7 +1169,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(49),
                 offset: None,
@@ -1204,7 +1207,7 @@ mod tests {
 
         assert!(action.next().is_none());
         drop(action);
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let req = Message::deserialize(&data).unwrap();
         let req_header = req.header;
@@ -1232,7 +1235,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
 
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.handle_delay_resp(
             Header {
@@ -1249,7 +1252,7 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
 
-        assert_eq!(port.filter.last_measurement.take(), None);
+        assert_eq!(port.core.filter.last_measurement.take(), None);
 
         let mut action = port.handle_delay_resp(
             Header {
@@ -1266,9 +1269,9 @@ mod tests {
         assert!(action.next().is_none());
         drop(action);
 
-        assert_eq!(port.mean_delay, Some(Duration::from_micros(100)));
+        assert_eq!(port.core.mean_delay, Some(Duration::from_micros(100)));
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(100),
                 offset: None,
@@ -1285,7 +1288,7 @@ mod tests {
         let state = setup_test_state();
 
         let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
-        port.config.delay_mechanism = DelayMechanism::P2P {
+        port.core.config.delay_mechanism = DelayMechanism::P2P {
             interval: Interval::from_log_2(1),
         };
 
@@ -1309,12 +1312,12 @@ mod tests {
         };
         let data = data.to_owned();
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let mut actions = port.handle_send_timestamp(context, Time::from_micros(50));
         assert!(actions.next().is_none());
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let req = Message::deserialize(&data).unwrap();
         assert!(matches!(req.body, MessageBody::PDelayReq(_)));
@@ -1333,7 +1336,7 @@ mod tests {
         assert!(actions.next().is_none());
         drop(actions);
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(150),
                 offset: None,
@@ -1350,7 +1353,7 @@ mod tests {
         let state = setup_test_state();
 
         let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
-        port.config.delay_mechanism = DelayMechanism::P2P {
+        port.core.config.delay_mechanism = DelayMechanism::P2P {
             interval: Interval::from_log_2(1),
         };
 
@@ -1374,12 +1377,12 @@ mod tests {
         };
         let data = data.to_owned();
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let mut actions = port.handle_send_timestamp(context, Time::from_micros(50));
         assert!(actions.next().is_none());
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let req = Message::deserialize(&data).unwrap();
         assert!(matches!(req.body, MessageBody::PDelayReq(_)));
@@ -1399,7 +1402,7 @@ mod tests {
         );
         assert!(actions.next().is_none());
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let mut actions = port.handle_peer_delay_response_follow_up(
             Header {
@@ -1415,7 +1418,7 @@ mod tests {
         assert!(actions.next().is_none());
         drop(actions);
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(153),
                 offset: None,
@@ -1432,7 +1435,7 @@ mod tests {
         let state = setup_test_state();
 
         let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
-        port.config.delay_mechanism = DelayMechanism::P2P {
+        port.core.config.delay_mechanism = DelayMechanism::P2P {
             interval: Interval::from_log_2(1),
         };
 
@@ -1456,12 +1459,12 @@ mod tests {
         };
         let data = data.to_owned();
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let mut actions = port.handle_send_timestamp(context, Time::from_micros(50));
         assert!(actions.next().is_none());
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let req = Message::deserialize(&data).unwrap();
         assert!(matches!(req.body, MessageBody::PDelayReq(_)));
@@ -1479,7 +1482,7 @@ mod tests {
         );
         assert!(actions.next().is_none());
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let mut actions = port.handle_peer_delay_response(
             Header {
@@ -1498,7 +1501,7 @@ mod tests {
         drop(actions);
 
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(153),
                 offset: None,
@@ -1515,7 +1518,7 @@ mod tests {
         let state = setup_test_state();
 
         let mut port = setup_test_port_custom_filter::<TestFilter>(&state, ());
-        port.config.delay_mechanism = DelayMechanism::P2P {
+        port.core.config.delay_mechanism = DelayMechanism::P2P {
             interval: Interval::from_log_2(1),
         };
 
@@ -1539,12 +1542,12 @@ mod tests {
         };
         let data = data.to_owned();
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let mut actions = port.handle_send_timestamp(context, Time::from_micros(50));
         assert!(actions.next().is_none());
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let req = Message::deserialize(&data).unwrap();
         assert!(matches!(req.body, MessageBody::PDelayReq(_)));
@@ -1564,7 +1567,7 @@ mod tests {
         assert!(actions.next().is_none());
         drop(actions);
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(150),
                 offset: None,
@@ -1574,7 +1577,7 @@ mod tests {
                 raw_delay_offset: None,
             })
         );
-        assert!(!matches!(port.port_state, PortState::Faulty));
+        assert!(!matches!(port.core.port_state, PortState::Faulty));
 
         let mut actions = port.handle_peer_delay_response(
             Header {
@@ -1593,8 +1596,8 @@ mod tests {
         );
         assert!(actions.next().is_none());
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
-        assert!(matches!(port.port_state, PortState::Faulty));
+        assert!(port.core.filter.last_measurement.take().is_none());
+        assert!(matches!(port.core.port_state, PortState::Faulty));
 
         let mut actions = port.send_delay_request();
 
@@ -1612,12 +1615,12 @@ mod tests {
         };
         let data = data.to_owned();
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let mut actions = port.handle_send_timestamp(context, Time::from_micros(50));
         assert!(actions.next().is_none());
         drop(actions);
-        assert!(port.filter.last_measurement.take().is_none());
+        assert!(port.core.filter.last_measurement.take().is_none());
 
         let req = Message::deserialize(&data).unwrap();
         assert!(matches!(req.body, MessageBody::PDelayReq(_)));
@@ -1637,7 +1640,7 @@ mod tests {
         assert!(actions.next().is_none());
         drop(actions);
         assert_eq!(
-            port.filter.last_measurement.take(),
+            port.core.filter.last_measurement.take(),
             Some(Measurement {
                 event_time: Time::from_micros(150),
                 offset: None,
@@ -1647,6 +1650,6 @@ mod tests {
                 raw_delay_offset: None,
             })
         );
-        assert!(!matches!(port.port_state, PortState::Faulty));
+        assert!(!matches!(port.core.port_state, PortState::Faulty));
     }
 }

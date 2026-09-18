@@ -14,21 +14,21 @@ use crate::{
 
 impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F, S> {
     pub(super) fn send_sync(&mut self) -> PortActionIterator<'_> {
-        if matches!(self.port_state, PortState::Master) {
+        if matches!(self.core.port_state, PortState::Master) {
             log::trace!("sending sync message");
 
-            let seq_id = self.sync_seq_ids.generate();
+            let seq_id = self.core.sync_seq_ids.generate();
             let packet_length = match self
                 .instance_state
                 .with_ref(|state| {
                     Message::sync(
                         &state.default_ds,
-                        self.port_identity,
+                        self.core.port_identity,
                         seq_id,
-                        self.config.minor_ptp_version.into(),
+                        self.core.config.minor_ptp_version.into(),
                     )
                 })
-                .serialize(&mut self.packet_buffer)
+                .serialize(&mut self.core.packet_buffer)
             {
                 Ok(message) => message,
                 Err(error) => {
@@ -39,13 +39,13 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
 
             actions![
                 PortAction::ResetSyncTimer {
-                    duration: self.config.sync_interval.as_core_duration(),
+                    duration: self.core.config.sync_interval.as_core_duration(),
                 },
                 PortAction::SendEvent {
                     context: TimestampContext {
                         inner: TimestampContextInner::Sync { id: seq_id },
                     },
-                    data: &self.packet_buffer[..packet_length],
+                    data: &self.core.packet_buffer[..packet_length],
                     link_local: false,
                 }
             ]
@@ -59,19 +59,19 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
         id: u16,
         timestamp: Time,
     ) -> PortActionIterator<'_> {
-        if matches!(self.port_state, PortState::Master) {
+        if matches!(self.core.port_state, PortState::Master) {
             let packet_length = match self
                 .instance_state
                 .with_ref(|state| {
                     Message::follow_up(
                         &state.default_ds,
-                        self.port_identity,
+                        self.core.port_identity,
                         id,
                         timestamp,
-                        self.config.minor_ptp_version.into(),
+                        self.core.config.minor_ptp_version.into(),
                     )
                 })
-                .serialize(&mut self.packet_buffer)
+                .serialize(&mut self.core.packet_buffer)
             {
                 Ok(length) => length,
                 Err(error) => {
@@ -84,7 +84,7 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
             };
 
             actions![PortAction::SendGeneral {
-                data: &self.packet_buffer[..packet_length],
+                data: &self.core.packet_buffer[..packet_length],
                 link_local: false,
             }]
         } else {
@@ -92,11 +92,15 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
         }
     }
 
+    /// Not inlined: its TLV scratch is `MAX_DATA_LEN` bytes twice over,
+    /// and a port that is never master (slave-only) should not carry that
+    /// in the frame of every poll.
+    #[inline(never)]
     pub(super) fn send_announce(
         &mut self,
         tlv_provider: &mut impl ForwardedTLVProvider,
     ) -> PortActionIterator<'_> {
-        if matches!(self.port_state, PortState::Master) {
+        if matches!(self.core.port_state, PortState::Master) {
             log::trace!("sending announce message");
 
             let mut tlv_buffer = [0; MAX_DATA_LEN];
@@ -105,9 +109,9 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
             let mut message = self.instance_state.with_ref(|state| {
                 Message::announce(
                     state,
-                    self.port_identity,
-                    self.announce_seq_ids.generate(),
-                    self.config.minor_ptp_version.into(),
+                    self.core.port_identity,
+                    self.core.announce_seq_ids.generate(),
+                    self.core.config.minor_ptp_version.into(),
                 )
             });
             let mut tlv_margin = MAX_DATA_LEN - message.wire_size();
@@ -163,7 +167,7 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
 
             message.suffix = tlv_builder.build();
 
-            let packet_length = match message.serialize(&mut self.packet_buffer) {
+            let packet_length = match message.serialize(&mut self.core.packet_buffer) {
                 Ok(length) => length,
                 Err(error) => {
                     log::error!(
@@ -176,10 +180,10 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
 
             actions![
                 PortAction::ResetAnnounceTimer {
-                    duration: self.config.announce_interval.as_core_duration(),
+                    duration: self.core.config.announce_interval.as_core_duration(),
                 },
                 PortAction::SendGeneral {
-                    data: &self.packet_buffer[..packet_length],
+                    data: &self.core.packet_buffer[..packet_length],
                     link_local: false,
                 }
             ]
@@ -194,17 +198,17 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
         message: DelayReqMessage,
         timestamp: Time,
     ) -> PortActionIterator<'_> {
-        if matches!(self.port_state, PortState::Master) {
+        if matches!(self.core.port_state, PortState::Master) {
             log::debug!("Received DelayReq");
             let delay_resp_message = Message::delay_resp(
                 header,
                 message,
-                self.port_identity,
-                self.config.min_delay_req_interval(),
+                self.core.port_identity,
+                self.core.config.min_delay_req_interval(),
                 timestamp,
             );
 
-            let packet_length = match delay_resp_message.serialize(&mut self.packet_buffer) {
+            let packet_length = match delay_resp_message.serialize(&mut self.core.packet_buffer) {
                 Ok(length) => length,
                 Err(error) => {
                     log::error!("Could not serialize delay response: {:?}", error);
@@ -213,7 +217,7 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
             };
 
             actions![PortAction::SendGeneral {
-                data: &self.packet_buffer[..packet_length],
+                data: &self.core.packet_buffer[..packet_length],
                 link_local: false,
             }]
         } else {
@@ -230,14 +234,14 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
         let pdelay_resp_message = self.instance_state.with_ref(|state| {
             Message::pdelay_resp(
                 &state.default_ds,
-                self.port_identity,
+                self.core.port_identity,
                 header,
                 timestamp,
-                self.config.minor_ptp_version.into(),
+                self.core.config.minor_ptp_version.into(),
             )
         });
 
-        let packet_length = match pdelay_resp_message.serialize(&mut self.packet_buffer) {
+        let packet_length = match pdelay_resp_message.serialize(&mut self.core.packet_buffer) {
             Ok(length) => length,
             Err(error) => {
                 log::error!("Could not serialize pdelay response: {:?}", error);
@@ -246,7 +250,7 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
         };
 
         actions![PortAction::SendEvent {
-            data: &self.packet_buffer[..packet_length],
+            data: &self.core.packet_buffer[..packet_length],
             context: TimestampContext {
                 inner: TimestampContextInner::PDelayResp {
                     id: header.sequence_id,
@@ -266,24 +270,25 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
         let pdelay_resp_follow_up_messgae = self.instance_state.with_ref(|state| {
             Message::pdelay_resp_follow_up(
                 &state.default_ds,
-                self.port_identity,
+                self.core.port_identity,
                 requestor_identity,
                 id,
                 timestamp,
-                self.config.minor_ptp_version.into(),
+                self.core.config.minor_ptp_version.into(),
             )
         });
 
-        let packet_length = match pdelay_resp_follow_up_messgae.serialize(&mut self.packet_buffer) {
-            Ok(length) => length,
-            Err(error) => {
-                log::error!("Could not serialize pdelay_response_followup: {:?}", error);
-                return actions![];
-            }
-        };
+        let packet_length =
+            match pdelay_resp_follow_up_messgae.serialize(&mut self.core.packet_buffer) {
+                Ok(length) => length,
+                Err(error) => {
+                    log::error!("Could not serialize pdelay_response_followup: {:?}", error);
+                    return actions![];
+                }
+            };
 
         actions![PortAction::SendGeneral {
-            data: &self.packet_buffer[..packet_length],
+            data: &self.core.packet_buffer[..packet_length],
             link_local: true,
         }]
     }
@@ -316,7 +321,7 @@ mod tests {
 
         port.set_forced_port_state(PortState::Master);
 
-        port.config.delay_mechanism = DelayMechanism::E2E {
+        port.core.config.delay_mechanism = DelayMechanism::E2E {
             interval: Interval::from_log_2(2),
         };
 
@@ -369,7 +374,7 @@ mod tests {
             TimeInterval(I48F16::from_bits(900))
         );
 
-        port.config.delay_mechanism = DelayMechanism::E2E {
+        port.core.config.delay_mechanism = DelayMechanism::E2E {
             interval: Interval::from_log_2(5),
         };
 

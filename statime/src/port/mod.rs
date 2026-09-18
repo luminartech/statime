@@ -2,7 +2,11 @@
 //!
 //! See [`Port`] for a detailed description.
 
-use core::{cell::RefCell, ops::ControlFlow};
+use core::{
+    cell::RefCell,
+    fmt::{self, Debug},
+    ops::ControlFlow,
+};
 
 pub use actions::{
     ForwardedTLV, ForwardedTLVProvider, NoForwardedTLVs, PortAction, PortActionIterator,
@@ -142,7 +146,9 @@ pub(crate) mod state;
 /// let clock = system::Clock {};
 /// let rng = thread_rng();
 ///
-/// let port_in_bmca = instance.add_port(port_config, filter_config, clock, rng);
+/// // The port's large state, placed where the caller wants it.
+/// let storage = Box::leak(Box::new(statime::PortStorage::new()));
+/// let port_in_bmca = instance.add_port(storage, port_config, filter_config, clock, rng);
 ///
 /// // To handle events for the port it needs to change to running mode
 /// let (running_port, actions) = port_in_bmca.end_bmca();
@@ -271,8 +277,16 @@ pub(crate) mod state;
 ///     handle_actions(resources, actions);
 /// }
 /// ```
-#[derive(Debug)]
 pub struct Port<'a, L, A, R, C, F: Filter, S = RefCell<PtpInstanceState>> {
+    /// The port's state, in the [`PortStorage`] the caller placed.
+    core: &'a mut PortCore<A, R, C, F>,
+    instance_state: &'a S,
+    lifecycle: L,
+}
+
+/// Everything a [`Port`] holds; the port itself is a handle onto it.
+#[derive(Debug)]
+pub(crate) struct PortCore<A, R, C, F: Filter> {
     config: PortConfig<()>,
     filter_config: F::Config,
     clock: C,
@@ -280,10 +294,8 @@ pub struct Port<'a, L, A, R, C, F: Filter, S = RefCell<PtpInstanceState>> {
     pub(crate) port_identity: PortIdentity,
     // Corresponds with PortDS port_state and enabled
     port_state: PortState,
-    instance_state: &'a S,
     bmca: Bmca<A>,
     packet_buffer: [u8; MAX_DATA_LEN],
-    lifecycle: L,
     rng: R,
     // Age of the last announce message that triggered
     // multiport disable. Once this gets larger than the
@@ -301,6 +313,56 @@ pub struct Port<'a, L, A, R, C, F: Filter, S = RefCell<PtpInstanceState>> {
     /// or `mean_link_delay` when DelayMechanism is P2P.
     mean_delay: Option<Duration>,
     peer_delay_state: PeerDelayState,
+}
+
+/// The state of one [`Port`], placed by the caller.
+///
+/// A port's typestate transitions ([`Port::start_bmca`], [`Port::end_bmca`])
+/// pass the port by value, so the port is a handle: its state lives here,
+/// where the caller chooses the placement (a `static`, an arena, a `Box`),
+/// and only the handle moves. One storage serves one port;
+/// [`PtpInstance::add_port`] fills it and binds it for the port's lifetime.
+pub struct PortStorage<A, R, C, F: Filter> {
+    core: Option<PortCore<A, R, C, F>>,
+}
+
+// Written out: a derive would not carry the `F::Config: Debug` bound the
+// core's derive needs.
+impl<L: Debug, A: Debug, R: Debug, C: Debug, F: Filter + Debug, S> Debug
+    for Port<'_, L, A, R, C, F, S>
+where
+    F::Config: Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Port")
+            .field("core", &self.core)
+            .field("lifecycle", &self.lifecycle)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<A: Debug, R: Debug, C: Debug, F: Filter + Debug> Debug for PortStorage<A, R, C, F>
+where
+    F::Config: Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PortStorage")
+            .field("core", &self.core)
+            .finish()
+    }
+}
+
+impl<A, R, C, F: Filter> PortStorage<A, R, C, F> {
+    /// Storage for a port that does not exist yet.
+    pub const fn new() -> Self {
+        Self { core: None }
+    }
+}
+
+impl<A, R, C, F: Filter> Default for PortStorage<A, R, C, F> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -386,17 +448,17 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
         {
             // We didn't hear messages from the master anymore, reset to the listening state
             // since we can't become master.
-            if !matches!(self.port_state, PortState::Listening) {
+            if !matches!(self.core.port_state, PortState::Listening) {
                 self.set_forced_port_state(PortState::Listening);
             }
 
             // consistent with Port<InBmca>::new()
-            let duration = self.config.announce_duration(&mut self.rng);
+            let duration = self.core.config.announce_duration(&mut self.core.rng);
             actions![PortAction::ResetAnnounceReceiptTimer { duration }]
         } else {
             // we didn't hear announce messages from other masters, so become master
             // ourselves
-            match self.port_state {
+            match self.core.port_state {
                 PortState::Master => (),
                 _ => self.set_forced_port_state(PortState::Master),
             }
@@ -415,9 +477,9 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
 
     /// Handle the filter update timer going off
     pub fn handle_filter_update_timer(&mut self) -> PortActionIterator<'_> {
-        let update = self.filter.update(&mut self.clock);
+        let update = self.core.filter.update(&mut self.core.clock);
         if update.mean_delay.is_some() {
-            self.mean_delay = update.mean_delay;
+            self.core.mean_delay = update.mean_delay;
         }
         PortActionIterator::from_filter(update)
     }
@@ -426,28 +488,12 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
     /// [`PtpInstance::bmca`].
     pub fn start_bmca(self) -> Port<'a, InBmca, A, R, C, F, S> {
         Port {
-            port_state: self.port_state,
+            core: self.core,
             instance_state: self.instance_state,
-            config: self.config,
-            filter_config: self.filter_config,
-            clock: self.clock,
-            port_identity: self.port_identity,
-            bmca: self.bmca,
-            rng: self.rng,
-            multiport_disable: self.multiport_disable,
-            packet_buffer: [0; MAX_DATA_LEN],
             lifecycle: InBmca {
                 pending_action: actions![],
                 local_best: None,
             },
-            announce_seq_ids: self.announce_seq_ids,
-            sync_seq_ids: self.sync_seq_ids,
-            delay_seq_ids: self.delay_seq_ids,
-            pdelay_seq_ids: self.pdelay_seq_ids,
-
-            filter: self.filter,
-            mean_delay: self.mean_delay,
-            peer_delay_state: self.peer_delay_state,
         }
     }
 
@@ -544,24 +590,9 @@ impl<'a, A, C, F: Filter, R, S> Port<'a, InBmca, A, R, C, F, S> {
     ) {
         (
             Port {
-                port_state: self.port_state,
+                core: self.core,
                 instance_state: self.instance_state,
-                config: self.config,
-                filter_config: self.filter_config,
-                clock: self.clock,
-                port_identity: self.port_identity,
-                bmca: self.bmca,
-                rng: self.rng,
-                multiport_disable: self.multiport_disable,
-                packet_buffer: [0; MAX_DATA_LEN],
                 lifecycle: Running,
-                announce_seq_ids: self.announce_seq_ids,
-                sync_seq_ids: self.sync_seq_ids,
-                delay_seq_ids: self.delay_seq_ids,
-                pdelay_seq_ids: self.pdelay_seq_ids,
-                filter: self.filter,
-                mean_delay: self.mean_delay,
-                peer_delay_state: self.peer_delay_state,
             },
             self.lifecycle.pending_action,
         )
@@ -572,17 +603,17 @@ impl<L, A, R, C: Clock, F: Filter, S> Port<'_, L, A, R, C, F, S> {
     fn set_forced_port_state(&mut self, mut state: PortState) {
         log::info!(
             "new state for port {}: {} -> {}",
-            self.port_identity.port_number,
-            self.port_state,
+            self.core.port_identity.port_number,
+            self.core.port_state,
             state
         );
-        core::mem::swap(&mut self.port_state, &mut state);
+        core::mem::swap(&mut self.core.port_state, &mut state);
         if matches!(state, PortState::Slave(_) | PortState::Faulty)
-            || matches!(self.port_state, PortState::Faulty)
+            || matches!(self.core.port_state, PortState::Faulty)
         {
-            let mut filter = F::new(self.filter_config.clone());
-            core::mem::swap(&mut filter, &mut self.filter);
-            filter.demobilize(&mut self.clock);
+            let mut filter = F::new(self.core.filter_config.clone());
+            core::mem::swap(&mut filter, &mut self.core.filter);
+            filter.demobilize(&mut self.core.clock);
         }
     }
 }
@@ -590,37 +621,37 @@ impl<L, A, R, C: Clock, F: Filter, S> Port<'_, L, A, R, C, F, S> {
 impl<L, A, R, C, F: Filter, S> Port<'_, L, A, R, C, F, S> {
     /// Indicate whether this [`Port`] is steering its clock.
     pub fn is_steering(&self) -> bool {
-        matches!(self.port_state, PortState::Slave(_))
+        matches!(self.core.port_state, PortState::Slave(_))
     }
 
     /// Indicate whether this [`Port`] is in the master state.
     pub fn is_master(&self) -> bool {
-        matches!(self.port_state, PortState::Master)
+        matches!(self.core.port_state, PortState::Master)
     }
 
     pub(crate) fn state(&self) -> &PortState {
-        &self.port_state
+        &self.core.port_state
     }
 
     pub(crate) fn number(&self) -> u16 {
-        self.port_identity.port_number
+        self.core.port_identity.port_number
     }
 
     /// Get a copy of the port dataset of the port
     pub fn port_ds(&self) -> PortDS {
         PortDS {
-            port_identity: self.port_identity,
-            port_state: match self.port_state {
+            port_identity: self.core.port_identity,
+            port_state: match self.core.port_state {
                 PortState::Faulty => observability::port::PortState::Faulty,
                 PortState::Listening => observability::port::PortState::Listening,
                 PortState::Master => observability::port::PortState::Master,
                 PortState::Passive => observability::port::PortState::Passive,
                 PortState::Slave(_) => observability::port::PortState::Slave,
             },
-            log_announce_interval: self.config.announce_interval.as_log_2(),
-            announce_receipt_timeout: self.config.announce_receipt_timeout,
-            log_sync_interval: self.config.sync_interval.as_log_2(),
-            delay_mechanism: match self.config.delay_mechanism {
+            log_announce_interval: self.core.config.announce_interval.as_log_2(),
+            announce_receipt_timeout: self.core.config.announce_receipt_timeout,
+            log_sync_interval: self.core.config.sync_interval.as_log_2(),
+            delay_mechanism: match self.core.config.delay_mechanism {
                 crate::config::DelayMechanism::E2E { interval } => {
                     observability::port::DelayMechanism::E2E {
                         log_min_delay_req_interval: interval.as_log_2(),
@@ -629,22 +660,22 @@ impl<L, A, R, C, F: Filter, S> Port<'_, L, A, R, C, F, S> {
                 crate::config::DelayMechanism::P2P { interval } => {
                     observability::port::DelayMechanism::P2P {
                         log_min_p_delay_req_interval: interval.as_log_2(),
-                        mean_link_delay: self.mean_delay.map(|v| v.into()).unwrap_or_default(),
+                        mean_link_delay: self.core.mean_delay.map(|v| v.into()).unwrap_or_default(),
                     }
                 }
             },
             version_number: 2,
-            minor_version_number: self.config.minor_ptp_version as u8,
-            delay_asymmetry: self.config.delay_asymmetry.into(),
-            master_only: self.config.master_only,
+            minor_version_number: self.core.config.minor_ptp_version as u8,
+            delay_asymmetry: self.core.config.delay_asymmetry.into(),
+            master_only: self.core.config.master_only,
         }
     }
 
     /// If this port is in the slave state, this returns the current estimate
     /// of the current_ds offset_to_master and mean_delay fields.
     pub fn port_current_ds_contribution(&self) -> Option<FilterEstimate> {
-        if matches!(self.port_state, PortState::Slave(_)) {
-            Some(self.filter.current_estimates())
+        if matches!(self.core.port_state, PortState::Slave(_)) {
+            Some(self.core.filter.current_estimates())
         } else {
             None
         }
@@ -655,6 +686,7 @@ impl<'a, A, C, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'a, InBmca, A, 
     /// Create a new port from a port dataset on a given interface.
     pub(crate) fn new(
         instance_state: &'a S,
+        storage: &'a mut PortStorage<A, R, C, F>,
         config: PortConfig<A>,
         filter_config: F::Config,
         clock: C,
@@ -670,7 +702,7 @@ impl<'a, A, C, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'a, InBmca, A, 
 
         let filter = F::new(filter_config.clone());
 
-        Port {
+        let core = storage.core.insert(PortCore {
             config: PortConfig {
                 acceptable_master_list: (),
                 delay_mechanism: config.delay_mechanism,
@@ -685,15 +717,10 @@ impl<'a, A, C, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'a, InBmca, A, 
             clock,
             port_identity,
             port_state: PortState::Listening,
-            instance_state,
             bmca,
             rng,
             multiport_disable: None,
             packet_buffer: [0; MAX_DATA_LEN],
-            lifecycle: InBmca {
-                pending_action: actions![PortAction::ResetAnnounceReceiptTimer { duration }],
-                local_best: None,
-            },
             announce_seq_ids: SequenceIdGenerator::new(),
             sync_seq_ids: SequenceIdGenerator::new(),
             delay_seq_ids: SequenceIdGenerator::new(),
@@ -701,6 +728,14 @@ impl<'a, A, C, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'a, InBmca, A, 
             filter,
             mean_delay: None,
             peer_delay_state: PeerDelayState::Empty,
+        });
+        Port {
+            core,
+            instance_state,
+            lifecycle: InBmca {
+                pending_action: actions![PortAction::ResetAnnounceReceiptTimer { duration }],
+                local_best: None,
+            },
         }
     }
 }
@@ -752,6 +787,7 @@ mod tests {
     ) -> Port<'_, Running, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, BasicFilter> {
         let port = Port::<_, _, _, _, BasicFilter>::new(
             state,
+            std::boxed::Box::leak(std::boxed::Box::new(PortStorage::new())),
             PortConfig {
                 acceptable_master_list: AcceptAnyMaster,
                 delay_mechanism: DelayMechanism::E2E {
@@ -780,6 +816,7 @@ mod tests {
     ) -> Port<'_, Running, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, BasicFilter> {
         let port = Port::<_, _, _, _, BasicFilter>::new(
             state,
+            std::boxed::Box::leak(std::boxed::Box::new(PortStorage::new())),
             PortConfig {
                 acceptable_master_list: AcceptAnyMaster,
                 delay_mechanism: DelayMechanism::E2E {
@@ -808,6 +845,7 @@ mod tests {
     ) -> Port<'_, Running, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, F> {
         let port = Port::<_, _, _, _, F>::new(
             state,
+            std::boxed::Box::leak(std::boxed::Box::new(PortStorage::new())),
             PortConfig {
                 acceptable_master_list: AcceptAnyMaster,
                 delay_mechanism: DelayMechanism::E2E {
